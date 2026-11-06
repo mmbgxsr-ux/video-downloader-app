@@ -14,7 +14,7 @@ android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
 android.accept_sdk_license = True
-android.extra_manifest_application_arguments = android:usesCleartextTraffic="true"
+android.extra_manifest_application_arguments = cleartext.txt
 
 [buildozer]
 log_level = 2
