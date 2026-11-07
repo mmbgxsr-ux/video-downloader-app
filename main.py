@@ -13,8 +13,13 @@ except Exception:
     ANDROID = False
 
 
-def serve():
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+def start_server():
+    # Bind synchronously so the port is already listening when the WebView
+    # loads the page (starting the server inside the thread raced with it).
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), H)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 if ANDROID:
@@ -32,8 +37,14 @@ if ANDROID:
 
 class DownloaderApp(App):
     def build(self):
-        threading.Thread(target=serve, daemon=True).start()
+        self.server = start_server()
         return Label(text="...")
+
+    def on_stop(self):
+        server = getattr(self, "server", None)
+        if server is not None:
+            server.shutdown()
+            server.server_close()
 
     def on_start(self):
         if ANDROID:
