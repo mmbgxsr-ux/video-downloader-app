@@ -9,7 +9,7 @@ requirements = python3,kivy==2.3.0,pyjnius,android,yt-dlp,certifi,openssl
 orientation = portrait
 fullscreen = 0
 p4a.branch = v2024.01.21
-android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
+android.permissions = INTERNET
 android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
