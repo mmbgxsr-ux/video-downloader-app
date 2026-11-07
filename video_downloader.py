@@ -9,8 +9,8 @@
 يُنصح بتثبيت ffmpeg لدمج الصوت والصورة وتحويل MP3.
 استخدمها فقط للمحتوى الذي تملكه أو يُسمح لك بتحميله.
 """
-import json, mimetypes, os, re, shutil, threading, time, uuid, webbrowser, urllib.request
-from urllib.parse import urlparse, parse_qs, unquote
+import html, json, mimetypes, os, re, shutil, threading, time, uuid, webbrowser, urllib.request
+from urllib.parse import urlparse, parse_qs, unquote, urljoin
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8765
@@ -192,7 +192,10 @@ def direct_download(job, url, out_dir):
     if job.get("title") == job.get("url"):
         job["title"] = name
     path = os.path.join(out_dir, name)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if job.get("referer"):
+        headers["Referer"] = job["referer"]
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
@@ -242,6 +245,8 @@ def ytdlp_download(job, url, fmt, out_dir, yt_dlp):
         "noplaylist": True,
         "quiet": True,
     }
+    if job.get("referer"):
+        opts["http_headers"] = {"Referer": job["referer"]}
     if fmt == "audio" and has_ff:
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]
     if has_ff and fmt != "audio":
@@ -295,10 +300,12 @@ def run_job(jid):
             save_history()
 
 
-def new_job(url, fmt):
+def new_job(url, fmt, referer=None, title=None):
     jid = uuid.uuid4().hex[:8]
-    JOBS[jid] = {"id": jid, "url": url, "fmt": fmt, "title": url, "status": "queued",
+    JOBS[jid] = {"id": jid, "url": url, "fmt": fmt, "title": title or url, "status": "queued",
                  "progress": 0, "created": time.time()}
+    if referer:
+        JOBS[jid]["referer"] = referer
     _trim_jobs()
     threading.Thread(target=run_job, args=(jid,), daemon=True).start()
     return jid
@@ -326,6 +333,68 @@ def public_view(j):
     return {k: j.get(k) for k in keys if k in j}
 
 
+
+# ----------------------------------------------------------- page link finder
+UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+_EXT = "mp4|m4v|webm|mkv|mov|m3u8|mpd|mp3|m4a"
+URL_RE = re.compile(r"https?://[^\s\"'<>\\]+?\.(?:%s)(?:\?[^\s\"'<>\\]*)?" % _EXT, re.I)
+ATTR_RE = re.compile(r"""(?:src|data-src|data-video|data-url|href|content)\s*=\s*["']([^"']+?\.(?:%s)(?:\?[^"']*)?)["']""" % _EXT, re.I)
+IFRAME_RE = re.compile(r"""<iframe\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", re.I)
+EMBED_HOSTS = ("youtube.com", "youtube-nocookie.com", "youtu.be", "vimeo.com",
+               "dailymotion.com", "facebook.com", "streamable.com", "twitch.tv")
+KIND_ORDER = {"فيديو": 0, "بث HLS": 1, "مضمّن": 2, "بث DASH": 3, "صوت": 4}
+
+
+def _kind(u):
+    ext = os.path.splitext(urlparse(u).path)[1].lower()
+    if ext == ".m3u8":
+        return "بث HLS"
+    if ext == ".mpd":
+        return "بث DASH"
+    if ext in (".mp3", ".m4a"):
+        return "صوت"
+    return "فيديو"
+
+
+def scan_page(url):
+    """Fetch a page and list the video/audio links found in it."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity",
+                                               "Accept": "text/html,application/xhtml+xml,*/*"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        final = r.geturl()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        charset = r.headers.get_content_charset() or "utf-8"
+        raw = r.read(2_000_000)
+    items, seen = [], set()
+
+    def add(u, kind):
+        u = html.unescape(u).strip()
+        full = urljoin(final, u)
+        if not re.match(r"^https?://", full, re.I) or full in seen:
+            return
+        seen.add(full)
+        name = unquote(os.path.basename(urlparse(full).path)) or urlparse(full).netloc
+        items.append({"url": full, "kind": kind, "name": name[:120]})
+
+    if ctype.startswith(("video/", "audio/")) or "mpegurl" in ctype:
+        add(final, _kind(final))
+        return items
+    text = raw.decode(charset, "replace")
+    # URLs inside inline JSON are often escaped.
+    text = text.replace("\\/", "/").replace("\\u0026", "&").replace("\\u002F", "/")
+    for m in ATTR_RE.finditer(text):
+        add(m.group(1), _kind(m.group(1)))
+    for m in URL_RE.finditer(text):
+        add(m.group(0), _kind(m.group(0)))
+    for m in IFRAME_RE.finditer(text):
+        src = urljoin(final, html.unescape(m.group(1)))
+        host = (urlparse(src).hostname or "").lower()
+        if any(host == h or host.endswith("." + h) for h in EMBED_HOSTS):
+            add(src, "مضمّن")
+    items.sort(key=lambda i: KIND_ORDER.get(i["kind"], 9))
+    return items[:30]
+
+
 # ------------------------------------------------------------------------ UI
 PAGE = r"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>تحميل الفيديوهات</title>
@@ -340,12 +409,13 @@ input{direction:ltr;text-align:left}button{background:#3b82f6;border:0;cursor:po
 .it{border-top:1px solid #334155;padding:12px 0}.it:first-child{border-top:0}
 .t{font-size:15px;word-break:break-word;margin-bottom:4px}.m{font-size:13px;color:#94a3b8;margin-bottom:6px;word-break:break-all}
 .row{display:flex;gap:8px;margin-top:8px}.row button{margin:0;padding:8px;font-size:14px;background:#334155}
+.alt{background:#334155}.fnd{border-top:1px solid #334155;padding:10px 0;display:flex;gap:8px;align-items:center}.fnd .n{flex:1;min-width:0;font-size:13px;word-break:break-all}.fnd .n b{color:#22c55e;margin-inline-end:6px}.fnd button{width:auto;margin:0;padding:8px 14px;font-size:14px}
 .link{width:auto;margin:0;padding:4px 10px;font-size:13px;background:#334155}
 </style></head><body>
 <div class="card"><h1>⬇️ تحميل فيديو برابط</h1>
 <input id="url" placeholder="الصق رابط الفيديو هنا" type="url">
 <select id="fmt"><option value="best">أفضل جودة (MP4)</option><option value="720">720p</option><option value="480">480p</option><option value="audio">صوت فقط (MP3)</option></select>
-<button id="go">ابدأ التحميل</button><div id="msg"></div>
+<button id="go">ابدأ التحميل</button><button id="scan" class="alt">ابحث عن الفيديو في الصفحة</button><div id="msg"></div><div id="found"></div>
 <small>يُحفظ الملف في مجلد downloads بجانب السكربت (وعلى أندرويد في Download/VideoDL). حمّل فقط ما يحق لك تحميله.</small></div>
 <div class="card"><h2><span>التحميلات</span><button class="link" id="clr">مسح السجل</button></h2><div id="list"></div></div>
 <script>
@@ -370,6 +440,9 @@ function render(jobs){
     if(j.status==='running'||j.status==='queued'){
       const b=el('div',null,'bar'),i=el('i');i.style.width=(j.progress||0)+'%';b.appendChild(i);it.appendChild(b);
       const r=el('div',null,'row'),c=el('button','إلغاء');c.onclick=()=>post('/cancel',{id:j.id});r.appendChild(c);it.appendChild(r);
+    }else if(j.status==='error'){
+      const r=el('div',null,'row'),c=el('button','ابحث عن الفيديو في الصفحة');
+      c.onclick=()=>{$('url').value=j.url;window.scrollTo(0,0);scan(j.url)};r.appendChild(c);it.appendChild(r);
     }else if(j.status==='done'&&j.can_open){
       const r=el('div',null,'row'),o=el('button','فتح'),h=el('button','مشاركة');
       o.onclick=()=>post('/open',{id:j.id});h.onclick=()=>post('/open',{id:j.id,share:true});
@@ -379,17 +452,36 @@ function render(jobs){
   });
 }
 async function refresh(){try{render(await (await fetch('/jobs')).json())}catch(e){}}
-async function start(url){
+async function start(url,extra){
   if(!/^https?:\/\//i.test(url)){$('msg').textContent='أدخل رابطاً صحيحاً يبدأ بـ http أو https';return}
   $('go').disabled=true;$('msg').textContent='جارٍ البدء...';
   try{
-    const j=await post('/start',{url,fmt:$('fmt').value});
+    const j=await post('/start',Object.assign({url,fmt:$('fmt').value},extra||{}));
     if(!j.id)throw new Error(j.error||'bad response');
     $('msg').textContent='أُضيف إلى القائمة'; $('url').value='';
   }catch(e){$('msg').textContent='❌ تعذّر البدء: '+e.message}
   $('go').disabled=false; refresh();
 }
+async function scan(url){
+  const box=$('found'); box.textContent='';
+  if(!/^https?:\/\//i.test(url)){$('msg').textContent='أدخل رابط الصفحة أولاً';return}
+  $('msg').textContent='جارٍ البحث في الصفحة...';
+  try{
+    const j=await post('/scan',{url});
+    if(j.error)throw new Error(j.error);
+    if(!j.items.length){$('msg').textContent='لم أجد روابط فيديو في هذه الصفحة (قد يكون محمياً أو يُحمَّل بجافاسكربت)';return}
+    $('msg').textContent='وجدت '+j.items.length+' رابطاً — اختر ما تريد تحميله:';
+    j.items.forEach(it=>{
+      const r=el('div',null,'fnd'),n=el('div',null,'n');
+      n.appendChild(el('b',it.kind));n.appendChild(document.createTextNode(it.name));
+      const b=el('button','تحميل');
+      b.onclick=()=>{b.disabled=true;start(it.url,{referer:url,title:it.name})};
+      r.appendChild(n);r.appendChild(b);box.appendChild(r);
+    });
+  }catch(e){$('msg').textContent='❌ تعذّر فحص الصفحة: '+e.message}
+}
 $('go').onclick=()=>start($('url').value.trim());
+$('scan').onclick=()=>scan($('url').value.trim());
 $('clr').onclick=async()=>{await post('/clear');refresh()};
 const q=new URLSearchParams(location.search).get('u');
 if(q){history.replaceState(null,'','/');$('url').value=q;start(q)}
@@ -451,7 +543,18 @@ class H(BaseHTTPRequestHandler):
             url = str(data.get("url", ""))
             if not re.match(r"^https?://", url, re.I):
                 return self._json({"error": "bad url"}, 400)
-            return self._json({"id": new_job(url, str(data.get("fmt", "best")))})
+            ref = str(data.get("referer") or "")
+            title = str(data.get("title") or "")[:150] or None
+            return self._json({"id": new_job(url, str(data.get("fmt", "best")),
+                                             ref if re.match(r"^https?://", ref, re.I) else None, title)})
+        if path == "/scan":
+            url = str(data.get("url", ""))
+            if not re.match(r"^https?://", url, re.I):
+                return self._json({"error": "bad url"}, 400)
+            try:
+                return self._json({"items": scan_page(url)})
+            except Exception as e:
+                return self._json({"error": str(e)[:200] or e.__class__.__name__}, 502)
         if path == "/cancel":
             return self._json({"ok": cancel_job(str(data.get("id", "")))})
         if path == "/clear":
