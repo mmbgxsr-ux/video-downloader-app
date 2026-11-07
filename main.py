@@ -26,11 +26,12 @@ except Exception:
 ANDROID = False
 if ON_ANDROID:
     try:
-        from android.runnables import run_on_ui_thread
-        from jnius import autoclass
+        # Only pyjnius is needed: the `android.runnables` helper is not shipped
+        # in this build ("No module named 'android.runnables'").
+        from jnius import PythonJavaClass, autoclass, java_method
         ANDROID = True
     except Exception:
-        fail("Cannot import android/jnius")
+        fail("Cannot import jnius")
 
 
 def start_server():
@@ -42,8 +43,34 @@ def start_server():
 
 
 if ANDROID:
-    @run_on_ui_thread
+    _PENDING = []  # keep Python-side Runnables alive until they have run
+
+    class UiRunnable(PythonJavaClass):
+        __javainterfaces__ = ["java/lang/Runnable"]
+        __javacontext__ = "app"
+
+        def __init__(self, func):
+            super().__init__()
+            self.func = func
+
+        @java_method("()V")
+        def run(self):
+            try:
+                self.func()
+            finally:
+                if self in _PENDING:
+                    _PENDING.remove(self)
+
+    def run_on_ui(func):
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        r = UiRunnable(func)
+        _PENDING.append(r)
+        activity.runOnUiThread(r)
+
     def open_webview(url):
+        run_on_ui(lambda: _open_webview(url))
+
+    def _open_webview(url):
         # Runs on the Android UI thread; errors are caught so they can be shown.
         try:
             WebView = autoclass("android.webkit.WebView")
@@ -94,7 +121,10 @@ class DownloaderApp(App):
             fail("Local server did not answer at " + url)
             return
         if ANDROID:
-            open_webview(url)
+            try:
+                open_webview(url)
+            except Exception:
+                fail("Cannot schedule WebView on the UI thread")
         else:
             self.label.text = "Open " + url
             webbrowser.open(url)
