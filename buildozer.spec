@@ -17,6 +17,7 @@ android.minapi = 24
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 android.extra_manifest_application_arguments = cleartext.txt
+android.add_libs_arm64_v8a = libs/arm64-v8a/*.so
 
 [buildozer]
 log_level = 2

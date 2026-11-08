@@ -154,6 +154,7 @@ class DownloaderApp(App):
         self.attempts = 0
         self.opened = False
         self.shared = None
+        self.listener_ready = False
         if STATE["error"] is None:
             if ANDROID:
                 try:
@@ -216,7 +217,9 @@ class DownloaderApp(App):
         if ANDROID:
             try:
                 open_webview(url)
-                register_intent_listener()
+                if not self.listener_ready:
+                    register_intent_listener()
+                    self.listener_ready = True
                 Clock.schedule_once(lambda dt: run_on_ui(request_notifications), 4)
             except Exception:
                 fail("Cannot schedule WebView on the UI thread")
@@ -226,6 +229,23 @@ class DownloaderApp(App):
 
     def on_pause(self):
         return True  # keep the app alive in the background
+
+    def on_resume(self):
+        # The background service stops itself after a couple of idle minutes; if the
+        # app is reopened after that, bring the server back and reload the page.
+        if self.opened and not STATE["error"] and not self.server_ok():
+            self.opened = False
+            self.attempts = 0
+            self.shared = None  # do not start the shared link's download again
+            if ANDROID and self.mode == "service":
+                try:
+                    start_service()
+                except Exception:
+                    traceback.print_exc()
+                    self.start_local()
+            elif self.server is None:
+                self.start_local()
+            Clock.schedule_interval(self.wait_for_server, 0.5)
 
     def on_stop(self):
         if self.server is not None:
