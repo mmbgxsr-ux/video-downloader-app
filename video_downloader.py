@@ -148,13 +148,20 @@ def publish_to_downloads(path):
         name = os.path.basename(path)
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         ContentValues = autoclass("android.content.ContentValues")
-        Downloads = autoclass("android.provider.MediaStore$Downloads")
+        # The gallery only lists items from the Video/Audio collections; the Downloads
+        # collection shows up in the Files app but never in the gallery.
+        if mime.startswith("video/"):
+            coll, folder = autoclass("android.provider.MediaStore$Video$Media"), "Movies/VideoDL"
+        elif mime.startswith("audio/"):
+            coll, folder = autoclass("android.provider.MediaStore$Audio$Media"), "Music/VideoDL"
+        else:
+            coll, folder = autoclass("android.provider.MediaStore$Downloads"), "Download/VideoDL"
         values = ContentValues()
         values.put("_display_name", name)
         values.put("mime_type", mime)
-        values.put("relative_path", "Download/VideoDL")
+        values.put("relative_path", folder)
         resolver = ctx.getContentResolver()
-        uri = resolver.insert(Downloads.EXTERNAL_CONTENT_URI, values)
+        uri = resolver.insert(coll.EXTERNAL_CONTENT_URI, values)
         if uri is None:
             return None
         try:
@@ -169,7 +176,7 @@ def publish_to_downloads(path):
                 pass
             raise
         os.remove(path)
-        return {"display": "Download/VideoDL/" + name, "uri": str(uri.toString()), "mime": mime}
+        return {"display": folder + "/" + name, "uri": str(uri.toString()), "mime": mime}
     except Exception:
         return None
 
@@ -654,7 +661,7 @@ button{background:var(--pri);color:#fff;border:0;cursor:pointer;font-weight:bold
 <label class="ck"><input type="checkbox" id="pl"> قائمة تشغيل: حمّل كل فيديوهاتها (حتى 50)</label>
 <div class="fr"><select id="fmt"></select><button id="probe" class="alt">فحص الجودات</button></div>
 <button id="go">ابدأ التحميل</button><button id="scan" class="alt">ابحث عن الفيديو في الصفحة</button><div id="msg"></div><div id="found"></div>
-<small>يُحفظ الملف في مجلد downloads بجانب السكربت (وعلى أندرويد في Download/VideoDL). حمّل فقط ما يحق لك تحميله.</small></div>
+<small>يُحفظ الملف في مجلد downloads بجانب السكربت (وعلى أندرويد في Movies/VideoDL للفيديو وMusic/VideoDL للصوت). حمّل فقط ما يحق لك تحميله.</small></div>
 <div class="card"><h2><span>التحميلات</span><button class="link" id="clr">مسح السجل</button></h2><div id="list"></div></div>
 <script>
 const $=id=>document.getElementById(id);
