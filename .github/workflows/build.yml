@@ -67,10 +67,15 @@ jobs:
           f=openssl-1.1.1w.tar.gz
           mkdir -p "$d"
           if [ ! -f "$d/.mark-$f" ]; then
-            curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o "$d/$f" \
-              "https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/$f"
-            echo "cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8  $d/$f" | sha256sum -c -
-            touch "$d/.mark-$f"
+            if curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$d/$f" \
+                 "https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/$f" \
+               && echo "cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8  $d/$f" | sha256sum -c -; then
+              touch "$d/.mark-$f"
+            else
+              # Not fatal: python-for-android will try openssl.org itself.
+              echo "::warning::could not pre-fetch OpenSSL from GitHub"
+              rm -f "$d/$f"
+            fi
           fi
 
       - name: Build APK
