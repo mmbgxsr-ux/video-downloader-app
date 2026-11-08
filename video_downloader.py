@@ -268,6 +268,49 @@ def ytdlp_download(job, url, fmt, out_dir, yt_dlp):
     return path
 
 
+
+# ------------------------------------------------------- friendly error text
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# (lower-case fragments of the raw message, Arabic explanation); first match wins
+ERROR_RULES = [
+    (("private video", "video is private"), "الفيديو خاص ولا يمكن تحميله دون تسجيل الدخول إلى الحساب المسموح له."),
+    (("confirm your age", "age-restricted", "age restricted", "inappropriate for some users"),
+     "الفيديو مقيّد بالعمر ويتطلب تسجيل الدخول."),
+    (("not a bot", "confirm you’re not", "captcha"), "الموقع يطلب التحقق من أنك لست روبوتًا. جرّب لاحقًا أو من شبكة أخرى."),
+    (("drm",), "الفيديو محمي بـ DRM ولا يمكن تحميله."),
+    (("unsupported url",), "الرابط غير مدعوم مباشرة. جرّب زر «ابحث عن الفيديو في الصفحة»."),
+    (("members-only", "members only", "join this channel", "premium", "requires payment", "rental"),
+     "المحتوى للمشتركين أو المدفوع فقط."),
+    (("not available in your country", "geo restrict", "geo-restrict", "blocked it in your country"),
+     "الفيديو غير متاح في بلدك."),
+    (("live event will begin", "premieres in", "is upcoming", "this live event"), "بث مباشر لم يبدأ بعد أو لم ينتهِ."),
+    (("video unavailable", "this video is not available", "no longer available", "has been removed",
+      "been terminated", "does not exist", "video has been deleted", "content isn't available"),
+     "الفيديو غير متاح أو حُذف."),
+    (("requested format is not available", "no video formats found"),
+     "الجودة المطلوبة غير متاحة لهذا الفيديو. جرّب خيارًا آخر."),
+    (("ffmpeg",), "هذه الصيغة تحتاج ffmpeg وهو غير متوفر. جرّب جودة أخرى."),
+    (("http error 403", "forbidden"), "الموقع رفض الطلب (403). قد يتطلب تسجيل دخول أو يحجب التحميل."),
+    (("http error 404", "not found"), "الرابط غير موجود (404)."),
+    (("http error 429", "too many requests"), "طلبات كثيرة. انتظر قليلًا ثم أعد المحاولة."),
+    (("no space left",), "لا توجد مساحة كافية على الجهاز."),
+    (("name resolution", "network is unreachable", "timed out", "timeout", "connection refused",
+      "connection reset", "unable to download webpage", "urlopen error", "getaddrinfo", "ssl"),
+     "تعذّر الاتصال بالموقع أو بالإنترنت. تحقق من الاتصال وأعد المحاولة."),
+]
+
+
+def friendly_error(raw):
+    """Arabic explanation for common yt-dlp / network errors; falls back to the cleaned original."""
+    text = _ANSI.sub("", str(raw)).strip()
+    low = text.lower()
+    for needles, msg in ERROR_RULES:
+        if any(n in low for n in needles):
+            return msg
+    text = re.sub(r"^(ERROR:\s*)?(\[[^\]]+\]\s*)?", "", text)
+    return "حدث خطأ: " + text[:200]
+
+
 def run_job(jid):
     job = JOBS[jid]
     with SLOTS:  # at most MAX_PARALLEL downloads at once, the rest wait as "queued"
@@ -295,7 +338,8 @@ def run_job(jid):
             if job.get("cancel") or isinstance(e, Cancelled):
                 job["status"] = "cancelled"
             else:
-                job["status"], job["error"] = "error", str(e)[:300]
+                job["status"], job["error"] = "error", friendly_error(e)
+                job["error_raw"] = _ANSI.sub("", str(e))[:300]
         finally:
             save_history()
 
