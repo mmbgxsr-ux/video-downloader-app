@@ -34,6 +34,18 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: buildozer-${{ runner.os }}-
 
+      # The slow part (compiling Python and the recipes) lives in ./.buildozer.
+      # The key changes every ISO week so the weekly build re-installs the newest
+      # yt-dlp, and whenever the build configuration changes.
+      - name: Compute cache week
+        id: week
+        run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: p4a-${{ runner.os }}-${{ steps.week.outputs.week }}-${{ hashFiles('buildozer.spec', 'intent_filters.xml', 'cleartext.txt') }}
+
       - name: Install system packages
         run: |
           sudo apt-get update
@@ -49,6 +61,8 @@ jobs:
       - name: Build APK
         run: |
           set -o pipefail
+          # Always repackage the current sources, even when .buildozer was restored.
+          rm -rf .buildozer/android/app bin
           buildozer -v android debug 2>&1 | tee build.log
 
       - name: Show the real error
