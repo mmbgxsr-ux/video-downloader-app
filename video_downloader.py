@@ -134,51 +134,79 @@ def find_ffmpeg():
     return _FF["exe"]
 
 
+PUB_ERRORS = []  # why publishing to the public folders failed (shown in the job note)
+
+
 def publish_to_downloads(path):
-    """Android 10+: copy the finished file into the public Download/VideoDL folder
-    through MediaStore (no storage permission needed).
+    """Android 10+: copy the finished file into a public folder through MediaStore
+    (no storage permission needed): Movies/VideoDL and Music/VideoDL show up in the
+    gallery / music apps, anything else goes to Download/VideoDL.
     Returns {"display", "uri", "mime"} or None when not on Android / it failed."""
+    del PUB_ERRORS[:]
     ctx = _android_context()
     if ctx is None:
         return None
     try:
         from jnius import autoclass
         if autoclass("android.os.Build$VERSION").SDK_INT < 29:
+            PUB_ERRORS.append("أندرويد أقدم من 10")
             return None
         name = os.path.basename(path)
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         ContentValues = autoclass("android.content.ContentValues")
-        # The gallery only lists items from the Video/Audio collections; the Downloads
-        # collection shows up in the Files app but never in the gallery.
-        if mime.startswith("video/"):
-            coll, folder = autoclass("android.provider.MediaStore$Video$Media"), "Movies/VideoDL"
-        elif mime.startswith("audio/"):
-            coll, folder = autoclass("android.provider.MediaStore$Audio$Media"), "Music/VideoDL"
-        else:
-            coll, folder = autoclass("android.provider.MediaStore$Downloads"), "Download/VideoDL"
-        values = ContentValues()
-        values.put("_display_name", name)
-        values.put("mime_type", mime)
-        values.put("relative_path", folder)
         resolver = ctx.getContentResolver()
-        uri = resolver.insert(coll.EXTERNAL_CONTENT_URI, values)
-        if uri is None:
-            return None
+        targets = []
+        if mime.startswith("video/"):
+            targets.append(("android.provider.MediaStore$Video$Media", "Movies/VideoDL"))
+        elif mime.startswith("audio/"):
+            targets.append(("android.provider.MediaStore$Audio$Media", "Music/VideoDL"))
+        targets.append(("android.provider.MediaStore$Downloads", "Download/VideoDL"))  # fallback
+    except Exception as e:
+        PUB_ERRORS.append("%s: %s" % (e.__class__.__name__, str(e)[:150]))
+        return None
+    for cls, folder in targets:
+        uri = None
         try:
+            coll = autoclass(cls)
+            values = ContentValues()
+            values.put("_display_name", name)
+            values.put("mime_type", mime)
+            values.put("relative_path", folder)
+            uri = resolver.insert(coll.EXTERNAL_CONTENT_URI, values)
+            if uri is None:
+                raise RuntimeError("insert returned null")
             pfd = resolver.openFileDescriptor(uri, "w")
             fd = pfd.detachFd()
             with open(path, "rb") as src, os.fdopen(fd, "wb") as dst:
                 shutil.copyfileobj(src, dst, 1 << 20)
-        except Exception:
-            try:  # drop the half-written public file
-                resolver.delete(uri, None, None)
+            # Verify what MediaStore really stored instead of trusting the insert.
+            real, size = None, None
+            try:
+                cur = resolver.query(uri, ["_size", "_data"], None, None, None)
+                if cur is not None:
+                    if cur.moveToFirst():
+                        size, real = int(cur.getLong(0)), cur.getString(1)
+                    cur.close()
             except Exception:
                 pass
-            raise
-        os.remove(path)
-        return {"display": folder + "/" + name, "uri": str(uri.toString()), "mime": mime}
-    except Exception:
-        return None
+            if size is not None and size != os.path.getsize(path):
+                raise RuntimeError("حجم الملف المحفوظ %s لا يطابق الأصلي %s" % (size, os.path.getsize(path)))
+            if real:
+                try:  # make sure gallery / music apps index it right away
+                    autoclass("android.media.MediaScannerConnection").scanFile(ctx, [str(real)], [mime], None)
+                except Exception:
+                    pass
+            os.remove(path)
+            return {"display": str(real) if real else folder + "/" + name,
+                    "uri": str(uri.toString()), "mime": mime}
+        except Exception as e:
+            PUB_ERRORS.append("%s [%s]: %s" % (e.__class__.__name__, folder, str(e)[:150]))
+            if uri is not None:
+                try:  # drop the half-written public entry
+                    resolver.delete(uri, None, None)
+                except Exception:
+                    pass
+    return None
 
 
 def android_view(job, share=False):
@@ -450,6 +478,8 @@ def run_job(jid):
             else:
                 path = ytdlp_download(job, job["url"], job["fmt"], out_dir, yt_dlp)
             pub = publish_to_downloads(path) if path else None
+            if path and not pub and PUB_ERRORS:
+                job["note"] = "تعذّر النسخ للمجلد العام: " + " | ".join(PUB_ERRORS)[:300]
             job["file"] = pub["display"] if pub else path
             job["can_open"] = bool(pub)
             if pub:
