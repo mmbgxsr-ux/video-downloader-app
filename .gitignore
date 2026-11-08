@@ -4,3 +4,4 @@ __pycache__/
 bin/
 .buildozer/
 build.log
+attempt.log

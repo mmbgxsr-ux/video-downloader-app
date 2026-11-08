@@ -83,7 +83,24 @@ jobs:
           set -o pipefail
           # Always repackage the current sources, even when .buildozer was restored.
           rm -rf .buildozer/android/app bin
-          buildozer -v android debug 2>&1 | tee build.log
+          : > build.log
+          # Source downloads (github.com, openssl.org, ...) sometimes answer 5xx for
+          # a while. Retry the build when that is the only problem: packages that
+          # were already downloaded are kept, so each attempt gets further.
+          for attempt in 1 2 3 4 5; do
+            if buildozer -v android debug 2>&1 | tee attempt.log; then
+              cat attempt.log >> build.log
+              exit 0
+            fi
+            cat attempt.log >> build.log
+            if ! grep -q -E "Download failed: HTTP Error 5|HTTP Error 50[0-9]|Temporary failure in name resolution|Connection reset|timed out" attempt.log; then
+              echo "Build failed for a reason other than the network; not retrying."
+              exit 1
+            fi
+            echo "::warning::download error on attempt $attempt, retrying in 90s"
+            sleep 90
+          done
+          exit 1
 
       - name: Show the real error
         if: failure()
