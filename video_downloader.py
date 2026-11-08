@@ -29,22 +29,39 @@ LAST_ACTIVITY = time.time()  # last HTTP request; lets the Android service stop 
 _LOADED = False
 _SAVE_LOCK = threading.Lock()
 
-STD_FORMATS = ("best", "audio")
+APP_VERSION = "1.1"
+
+# audio choices: code -> (codec for ffmpeg, bitrate or None)
+AUDIO_FMTS = {"audio": ("mp3", "192"), "audio_320": ("mp3", "320"),
+              "audio_128": ("mp3", "128"), "audio_m4a": ("m4a", None)}
+STD_FORMATS = ("best", "worst") + tuple(AUDIO_FMTS)
 
 
 def valid_fmt(fmt):
     return fmt in STD_FORMATS or (fmt.isdigit() and 100 <= int(fmt) <= 4320)
 
 
+def is_audio_fmt(fmt):
+    return str(fmt) in AUDIO_FMTS
+
+
 def fmt_selector(fmt, has_ff):
-    """yt-dlp format string. Without ffmpeg only a single pre-merged file is possible."""
-    if fmt == "audio":
+    """yt-dlp format string. Without ffmpeg only a single pre-merged file is possible.
+    With ffmpeg, H.264/AAC (plays in every gallery app) is preferred and AV1 avoided."""
+    if fmt == "audio_m4a":
+        return "bestaudio[ext=m4a]/bestaudio/best"
+    if fmt in AUDIO_FMTS:
         return "bestaudio/best"
+    if fmt == "worst":
+        return "wv*+wa/w" if has_ff else "w[ext=mp4]/w"
     if fmt == "best":
-        return "bv*+ba/b" if has_ff else "b[ext=mp4]/b"
+        if has_ff:
+            return "bv*[vcodec!*=av01]+ba/bv*+ba/b"
+        return "b[ext=mp4]/b"
     h = int(fmt)
     if has_ff:
-        return "bv*[height<=%d]+ba/b[height<=%d]" % (h, h)
+        return ("bv*[height<=%d][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=%d][vcodec!*=av01]+ba/"
+                "bv*[height<=%d]+ba/b[height<=%d]/b" % (h, h, h, h))
     return "b[height<=%d][ext=mp4]/b[height<=%d]/b" % (h, h)
 
 
@@ -78,17 +95,22 @@ def _find_context():
         try:
             ctx = getattr(autoclass(cls), field)
             if ctx is not None:
-                return ctx
+                try:  # the application context outlives any single Activity/Service
+                    return ctx.getApplicationContext() or ctx
+                except Exception:
+                    return ctx
             CTX_ERRORS.append("%s.%s=null" % (cls.rsplit(".", 1)[1], field))
         except Exception as e:
             CTX_ERRORS.append("%s: %s" % (cls.rsplit(".", 1)[1], str(e)[:80]))
-    try:
-        app = autoclass("android.app.ActivityThread").currentApplication()
-        if app is not None:
-            return app
-        CTX_ERRORS.append("currentApplication=null")
-    except Exception as e:
-        CTX_ERRORS.append("ActivityThread: %s" % str(e)[:80])
+    for cls, meth in (("android.app.ActivityThread", "currentApplication"),
+                      ("android.app.AppGlobals", "getInitialApplication")):
+        try:
+            app = getattr(autoclass(cls), meth)()
+            if app is not None:
+                return app
+            CTX_ERRORS.append("%s=null" % meth)
+        except Exception as e:
+            CTX_ERRORS.append("%s: %s" % (cls.rsplit(".", 1)[1], str(e)[:80]))
     return None
 
 
@@ -109,7 +131,8 @@ def _android_context():
 
 
 def data_dir():
-    base = os.path.dirname(os.path.abspath(__file__))
+    # NOT the script folder: on Android it (files/app) is wiped on every app update.
+    base = os.environ.get("ANDROID_PRIVATE") or os.path.dirname(os.path.abspath(__file__))
     ctx = _android_context()
     if ctx is not None:
         try:
@@ -124,6 +147,25 @@ def get_out_dir():
     path = os.path.join(data_dir(), "downloads")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _download_dirs():
+    """Every folder where this app may have left a finished download (new and old versions)."""
+    dirs = {os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")}
+    priv = os.environ.get("ANDROID_PRIVATE")
+    if priv:
+        dirs.add(os.path.join(priv, "app", "downloads"))
+        dirs.add(os.path.join(priv, "downloads"))
+    try:
+        dirs.add(get_out_dir())
+    except Exception:
+        pass
+    return [os.path.realpath(d) for d in dirs]
+
+
+def in_download_dirs(path):
+    rp = os.path.realpath(path)
+    return any(rp.startswith(d + os.sep) for d in _download_dirs())
 
 
 _FF = {"checked": False, "exe": None, "loc": None}
@@ -176,26 +218,92 @@ def guess_mime(name):
             or "application/octet-stream")
 
 
-PUB_ERRORS = []  # why publishing to the public folders failed (shown in the job note)
+_PUB_LOCK = threading.Lock()
 
 
-def publish_to_downloads(path):
-    """Android 10+: copy the finished file into a public folder through MediaStore
-    (no storage permission needed): Movies/VideoDL and Music/VideoDL show up in the
-    gallery / music apps, anything else goes to Download/VideoDL.
-    Returns {"display", "uri", "mime"} or None when not on Android / it failed."""
-    del PUB_ERRORS[:]
-    ctx = _android_context()
-    if ctx is None:
+def _safe_name(name):
+    """A file name MediaStore always accepts: no reserved characters, at most ~200 bytes."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    stem, ext = os.path.splitext(name)
+    stem = stem.strip(" .").encode("utf-8")[:180].decode("utf-8", "ignore").strip(" .") or "video"
+    return stem + ext.lower()
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _unique_path(path):
+    stem, ext = os.path.splitext(path)
+    n, cand = 1, path
+    while os.path.exists(cand):
+        n += 1
+        cand = "%s (%d)%s" % (stem, n, ext)
+    return cand
+
+
+def _query_path(resolver, uri):
+    try:
+        cur = resolver.query(uri, ["_data"], None, None, None)
+        if cur is None:
+            return None
+        try:
+            return str(cur.getString(0)) if cur.moveToFirst() else None
+        finally:
+            cur.close()
+    except Exception:
         return None
+
+
+def _scan(ctx, path, mime):
+    """Ask the media scanner to index a file so gallery / music apps list it right away."""
+    if ctx is None or not path:
+        return
+    try:
+        from jnius import autoclass
+        autoclass("android.media.MediaScannerConnection").scanFile(ctx, [path], [mime], None)
+    except Exception:
+        pass
+
+
+def _copy_into(fd, path, size):
+    """Copy `path` into the open file descriptor `fd` and check that every byte arrived."""
+    try:
+        src = open(path, "rb")
+    except Exception:
+        os.close(fd)
+        raise
+    written = 0
+    with src, os.fdopen(fd, "wb") as dst:
+        while True:
+            buf = src.read(1 << 20)
+            if not buf:
+                break
+            dst.write(buf)
+            written += len(buf)
+        dst.flush()
+        try:
+            os.fsync(dst.fileno())
+        except OSError:
+            pass
+    if written != size:
+        raise RuntimeError("تم نسخ %d بايت من %d" % (written, size))
+
+
+def _publish_mediastore(ctx, path, name, mime, size, errors):
+    """Android 10+: insert the file through MediaStore (no storage permission needed).
+    The entry is flagged IS_PENDING while it is written, so the gallery only indexes it
+    once it is complete."""
     try:
         from jnius import autoclass
         if autoclass("android.os.Build$VERSION").SDK_INT < 29:
-            PUB_ERRORS.append("أندرويد أقدم من 10")
+            errors.append("أندرويد أقدم من 10")
             return None
-        name = os.path.basename(path)
-        mime = guess_mime(name)
         ContentValues = autoclass("android.content.ContentValues")
+        Integer = autoclass("java.lang.Integer")
         resolver = ctx.getContentResolver()
         targets = []
         if mime.startswith("video/"):
@@ -204,51 +312,92 @@ def publish_to_downloads(path):
             targets.append(("android.provider.MediaStore$Audio$Media", "Music/VideoDL"))
         targets.append(("android.provider.MediaStore$Downloads", "Download/VideoDL"))  # fallback
     except Exception as e:
-        PUB_ERRORS.append("%s: %s" % (e.__class__.__name__, str(e)[:150]))
+        errors.append("%s: %s" % (e.__class__.__name__, str(e)[:150]))
         return None
     for cls, folder in targets:
         uri = None
         try:
-            coll = autoclass(cls)
             values = ContentValues()
             values.put("_display_name", name)
             values.put("mime_type", mime)
             values.put("relative_path", folder)
-            uri = resolver.insert(coll.EXTERNAL_CONTENT_URI, values)
+            values.put("is_pending", Integer(1))
+            uri = resolver.insert(autoclass(cls).EXTERNAL_CONTENT_URI, values)
             if uri is None:
                 raise RuntimeError("insert returned null")
             pfd = resolver.openFileDescriptor(uri, "w")
-            fd = pfd.detachFd()
-            with open(path, "rb") as src, os.fdopen(fd, "wb") as dst:
-                shutil.copyfileobj(src, dst, 1 << 20)
-            # Verify what MediaStore really stored instead of trusting the insert.
-            real, size = None, None
-            try:
-                cur = resolver.query(uri, ["_size", "_data"], None, None, None)
-                if cur is not None:
-                    if cur.moveToFirst():
-                        size, real = int(cur.getLong(0)), cur.getString(1)
-                    cur.close()
-            except Exception:
-                pass
-            if size is not None and size != os.path.getsize(path):
-                raise RuntimeError("حجم الملف المحفوظ %s لا يطابق الأصلي %s" % (size, os.path.getsize(path)))
-            if real:
-                try:  # make sure gallery / music apps index it right away
-                    autoclass("android.media.MediaScannerConnection").scanFile(ctx, [str(real)], [mime], None)
-                except Exception:
-                    pass
-            os.remove(path)
-            return {"display": str(real) if real else folder + "/" + name,
-                    "uri": str(uri.toString()), "mime": mime}
+            _copy_into(pfd.detachFd(), path, size)
+            done = ContentValues()
+            done.put("is_pending", Integer(0))
+            resolver.update(uri, done, None, None)
+            real = _query_path(resolver, uri)
+            _scan(ctx, real, mime)
+            return {"display": real or folder + "/" + name, "uri": str(uri.toString()), "mime": mime}
         except Exception as e:
-            PUB_ERRORS.append("%s [%s]: %s" % (e.__class__.__name__, folder, str(e)[:150]))
+            errors.append("%s [%s]: %s" % (e.__class__.__name__, folder, str(e)[:150]))
             if uri is not None:
                 try:  # drop the half-written public entry
                     resolver.delete(uri, None, None)
                 except Exception:
                     pass
     return None
+
+
+def _publish_direct(ctx, path, name, mime, size, errors):
+    """Last resort: copy straight into the public folders (Android 9 and older need the
+    storage permission, which the app asks for at start)."""
+    root = "/storage/emulated/0"
+    try:
+        from jnius import autoclass
+        root = str(autoclass("android.os.Environment").getExternalStorageDirectory().getAbsolutePath())
+    except Exception:
+        pass
+    top = "Movies" if mime.startswith("video/") else "Music" if mime.startswith("audio/") else "Download"
+    for folder in dict.fromkeys((top + "/VideoDL", "Download/VideoDL")):
+        dest = None
+        try:
+            d = os.path.join(root, folder)
+            os.makedirs(d, exist_ok=True)
+            dest = _unique_path(os.path.join(d, name))
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            _copy_into(fd, path, size)
+            _scan(ctx, dest, mime)
+            return {"display": dest, "uri": None, "mime": mime}
+        except Exception as e:
+            errors.append("%s [direct %s]: %s" % (e.__class__.__name__, folder, str(e)[:150]))
+            if dest:
+                _remove_quietly(dest)
+    return None
+
+
+def publish_to_downloads(path, kind=None):
+    """Copy a finished file into a public folder so it shows up in the gallery
+    (Movies/VideoDL) or the music app (Music/VideoDL); anything else goes to Download/VideoDL.
+    Returns (info, errors): info is {"display", "uri", "mime"} or None when it failed or
+    when not on Android; errors lists why. The private original is deleted after a success."""
+    errors = []
+    if not ON_ANDROID:
+        return None, errors
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return None, ["الملف غير موجود: %s" % e]
+    name = _safe_name(os.path.basename(path))
+    mime = guess_mime(name)
+    if kind == "audio" and mime.startswith("video/"):  # audio-only .webm / .mp4
+        mime = "audio/webm" if name.lower().endswith(".webm") else "audio/mp4"
+    with _PUB_LOCK:
+        ctx = _android_context()
+        pub = None
+        if ctx is not None:
+            pub = _publish_mediastore(ctx, path, name, mime, size, errors)
+        else:
+            errors.append("تعذّر الوصول لسياق أندرويد: " + " | ".join(CTX_ERRORS))
+        if pub is None:
+            pub = _publish_direct(ctx, path, name, mime, size, errors)
+    if pub is not None:
+        _remove_quietly(path)
+    return pub, errors
 
 
 def android_view(job, share=False):
@@ -406,8 +555,8 @@ def ytdlp_download(job, url, fmt, out_dir, yt_dlp):
     has_ff = find_ffmpeg() is not None
     if not valid_fmt(fmt):
         fmt = "best"
-    if not has_ff and fmt == "audio":
-        job["note"] = "ffmpeg غير متوفر: سيُحفظ الصوت بصيغته الأصلية وليس MP3"
+    if not has_ff and is_audio_fmt(fmt):
+        job["note"] = "ffmpeg غير متوفر: سيُحفظ الصوت بصيغته الأصلية بدون تحويل"
 
     def hook(d):
         if job.get("cancel"):
@@ -437,9 +586,13 @@ def ytdlp_download(job, url, fmt, out_dir, yt_dlp):
         opts["ffmpeg_location"] = _FF["loc"]
     if job.get("referer"):
         opts["http_headers"] = {"Referer": job["referer"]}
-    if fmt == "audio" and has_ff:
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]
-    if has_ff and fmt != "audio":
+    if is_audio_fmt(fmt) and has_ff:
+        codec, quality = AUDIO_FMTS[fmt]
+        pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+        if quality:
+            pp["preferredquality"] = quality
+        opts["postprocessors"] = [pp]
+    if has_ff and not is_audio_fmt(fmt):
         opts["merge_output_format"] = "mp4"
 
     try:
@@ -501,12 +654,63 @@ def friendly_error(raw):
     return "حدث خطأ: " + text[:200]
 
 
+def resolve_output(path, out_dir, since):
+    """The downloaded file. yt-dlp occasionally reports a name that differs from the final one
+    (container change after merging / converting): then take the newest media file made since
+    the download started."""
+    if path and os.path.isfile(path):
+        return path
+    best = None
+    try:
+        for f in os.listdir(out_dir):
+            p = os.path.join(out_dir, f)
+            if not f.lower().endswith(tuple(MIME_FIX)) or not os.path.isfile(p):
+                continue
+            m = max(os.path.getmtime(p), os.path.getctime(p))
+            if m >= since - 5 and (best is None or m > best[0]):
+                best = (m, p)
+    except OSError:
+        pass
+    return best[1] if best else None
+
+
+def _apply_publish(job, pub, path):
+    """Record where the file ended up. `public` = visible in the gallery / music app;
+    `can_open` = we also hold a MediaStore uri, so Open / Share work."""
+    job["file"] = pub["display"] if pub else path
+    job["public"] = bool(pub)
+    job["can_open"] = bool(pub and pub.get("uri"))
+    if pub and pub.get("uri"):
+        job["uri"], job["mime"] = pub["uri"], pub["mime"]
+
+
+def publish_job(jid):
+    """Move a finished download that is still in the app's private folder into the gallery
+    (rescues files from earlier versions or from a failed copy). Returns (job, error)."""
+    job = JOBS.get(jid)
+    if not job or job.get("status") != "done":
+        return None, "غير موجود"
+    if job.get("public") or job.get("can_open"):
+        return job, None
+    path = str(job.get("file") or "")
+    if not path or not os.path.isfile(path) or not in_download_dirs(path):
+        return None, "الملف الأصلي لم يعد موجودًا على الجهاز"
+    pub, errs = publish_to_downloads(path, "audio" if is_audio_fmt(job.get("fmt")) else None)
+    if not pub:
+        return None, (" | ".join(errs) or "تعذّر الحفظ في المعرض")[:360]
+    job.pop("note", None)
+    _apply_publish(job, pub, path)
+    save_history()
+    return job, None
+
+
 def run_job(jid):
     job = JOBS[jid]
     with SLOTS:  # at most MAX_PARALLEL downloads at once, the rest wait as "queued"
         if job.get("status") != "queued":  # cancelled while waiting
             return
         job["status"] = "running"
+        t_start = time.time()
         save_history()
         try:
             out_dir = get_out_dir()
@@ -519,16 +723,21 @@ def run_job(jid):
                 path = direct_download(job, job["url"], out_dir)
             else:
                 path = ytdlp_download(job, job["url"], job["fmt"], out_dir, yt_dlp)
-            pub = publish_to_downloads(path) if path else None
-            if path and not pub:
-                if PUB_ERRORS:
-                    job["note"] = "تعذّر النسخ للمجلد العام: " + " | ".join(PUB_ERRORS)[:300]
-                elif "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ:
-                    job["note"] = "تعذّر الوصول لسياق أندرويد: " + " | ".join(CTX_ERRORS)[:300]
-            job["file"] = pub["display"] if pub else path
-            job["can_open"] = bool(pub)
-            if pub:
-                job["uri"], job["mime"] = pub["uri"], pub["mime"]
+            path = resolve_output(path, out_dir, t_start)
+            if not path:
+                raise RuntimeError("لم أجد الملف بعد انتهاء التحميل")
+            prev_note = job.get("note")
+            if ON_ANDROID:
+                job["note"] = "جارٍ الحفظ في المعرض..."
+            pub, errs = publish_to_downloads(path, "audio" if is_audio_fmt(job.get("fmt")) else None)
+            if prev_note:
+                job["note"] = prev_note
+            else:
+                job.pop("note", None)
+            if ON_ANDROID and not pub:
+                why = ("⚠️ لم يُحفظ في المعرض: " + " | ".join(errs))[:360]
+                job["note"] = (prev_note + " — " if prev_note else "") + why
+            _apply_publish(job, pub, path)
             job["status"], job["progress"] = "done", 100
         except Exception as e:
             if job.get("cancel") or isinstance(e, Cancelled):
@@ -640,7 +849,8 @@ def clear_finished():
 
 
 def public_view(j):
-    keys = ("id", "title", "url", "status", "progress", "speed", "note", "error", "file", "can_open", "created")
+    keys = ("id", "title", "url", "status", "progress", "speed", "note", "error", "file", "can_open",
+            "public", "created")
     return {k: j.get(k) for k in keys if k in j}
 
 
@@ -730,13 +940,15 @@ button{background:var(--pri);color:#fff;border:0;cursor:pointer;font-weight:bold
 .ur{display:flex;gap:8px}.ur input{flex:1;min-width:0}.ur button{width:auto;padding:12px 14px;background:var(--sec);color:var(--fg)}
 .fr{display:flex;gap:8px}.fr select{flex:1;min-width:0}.fr button{width:auto;white-space:nowrap}
 .ck{display:flex;align-items:center;gap:8px;font-size:14px;margin-bottom:12px}.ck input{width:auto;margin:0}
+.hint{font-size:13px;color:var(--mut);margin:-4px 0 12px}.hint:empty{display:none}
 </style></head><body>
 <div class="card"><div class="top"><h1>⬇️ تحميل فيديو برابط</h1><button class="link" id="thm" title="تبديل المظهر">🌓</button></div>
 <div class="ur"><input id="url" placeholder="الصق رابط الفيديو هنا" type="url"><button id="paste" title="لصق من الحافظة">📋</button><button id="xurl" title="مسح">✕</button></div>
 <label class="ck"><input type="checkbox" id="pl"> قائمة تشغيل: حمّل كل فيديوهاتها (حتى 50)</label>
 <div class="fr"><select id="fmt"></select><button id="probe" class="alt">فحص الجودات</button></div>
+<div id="hint" class="hint"></div>
 <button id="go">ابدأ التحميل</button><button id="scan" class="alt">ابحث عن الفيديو في الصفحة</button><div id="msg"></div><div id="found"></div>
-<small>يُحفظ الملف في مجلد downloads بجانب السكربت (وعلى أندرويد في Movies/VideoDL للفيديو وMusic/VideoDL للصوت). حمّل فقط ما يحق لك تحميله.</small></div>
+<small>يُحفظ الملف في مجلد downloads بجانب السكربت (وعلى أندرويد في Movies/VideoDL للفيديو وMusic/VideoDL للصوت، فيظهر في المعرض). حمّل فقط ما يحق لك تحميله. <span id="ver"></span></small></div>
 <div class="card"><h2><span>التحميلات</span><button class="link" id="clr">مسح السجل</button></h2><div id="list"></div></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -749,15 +961,22 @@ function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.s
  if(!t)t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';setTheme(t)})();
 $('thm').onclick=()=>setTheme(document.documentElement.dataset.theme==='light'?'dark':'light');
 /* quality list */
-const DEF=[['best','أفضل جودة (MP4)'],['720','720p'],['480','480p'],['audio','صوت فقط (MP3)']];
+let CAPS={ffmpeg:false};
+function audioOpts(){return CAPS.ffmpeg
+  ?[['audio_320','صوت MP3 · 320kbps'],['audio','صوت MP3 · 192kbps'],['audio_128','صوت MP3 · 128kbps'],['audio_m4a','صوت M4A (AAC)']]
+  :[['audio','صوت فقط (الصيغة الأصلية)'],['audio_m4a','صوت M4A (إن توفر)']]}
+function defOpts(){return [['best','أفضل جودة (MP4)'],['2160','4K · 2160p'],['1440','2K · 1440p'],['1080','Full HD · 1080p'],
+  ['720','HD · 720p'],['480','480p'],['360','360p'],['240','240p'],['144','144p'],['worst','أصغر حجم']].concat(audioOpts())}
 function fillFmt(opts){const s=$('fmt');s.textContent='';opts.forEach(o=>{const e=el('option',o[1]);e.value=o[0];s.appendChild(e)})}
-fillFmt(DEF);
+function showHint(){$('hint').textContent=CAPS.ffmpeg?'':'ملاحظة: بدون ffmpeg تُحمَّل الجودة المطلوبة فقط لو كانت جاهزة (فيديو+صوت) في ملف واحد، وإلا تُحمَّل أقرب جودة أقل. اضغط «فحص الجودات» لمعرفة المتاح فعلاً.'}
+fillFmt(defOpts());
+fetch('/caps').then(r=>r.json()).then(c=>{CAPS=c;fillFmt(defOpts());showHint();if(c.version)$('ver').textContent='· الإصدار '+c.version}).catch(()=>showHint());
 function getUrl(){const v=$('url').value.trim();const m=v.match(/https?:\/\/\S+/i);return m?m[0]:v}
-$('url').addEventListener('input',()=>fillFmt(DEF));
-$('xurl').onclick=()=>{$('url').value='';$('found').textContent='';$('msg').textContent='';fillFmt(DEF)};
+$('url').addEventListener('input',()=>fillFmt(defOpts()));
+$('xurl').onclick=()=>{$('url').value='';$('found').textContent='';$('msg').textContent='';fillFmt(defOpts())};
 $('paste').onclick=async()=>{
   try{const t=await navigator.clipboard.readText();
-    if(t&&t.trim()){const m=t.match(/https?:\/\/\S+/i);$('url').value=m?m[0]:t.trim();fillFmt(DEF);return}
+    if(t&&t.trim()){const m=t.match(/https?:\/\/\S+/i);$('url').value=m?m[0]:t.trim();fillFmt(defOpts());return}
   }catch(e){}
   $('msg').textContent='تعذّر القراءة من الحافظة تلقائياً — اضغط مطولاً على الحقل ثم «لصق»';$('url').focus()};
 $('probe').onclick=async()=>{
@@ -767,11 +986,13 @@ $('probe').onclick=async()=>{
   try{
     const j=await post('/probe',{url,playlist:$('pl').checked});
     if(j.error)throw new Error(j.error);
-    let o=DEF;
+    CAPS.ffmpeg=!!j.ffmpeg;showHint();
+    let o=defOpts();
     if(j.heights.length){
       o=[['best','أفضل جودة متاحة']];
       j.heights.forEach(h=>o.push([String(h),h+'p']));
-      o.push(['audio',j.ffmpeg?'صوت فقط (MP3)':'صوت فقط (الصيغة الأصلية)']);
+      o.push(['worst','أصغر حجم']);
+      o=o.concat(audioOpts());
     }
     fillFmt(o);
     if(j.is_playlist)$('msg').textContent='قائمة تشغيل: '+j.title+' — '+j.count+' فيديو (الجودة المختارة تُطبَّق على الكل)';
@@ -790,7 +1011,8 @@ function render(jobs){
     let meta=ST[j.status]||j.status;
     if(j.status==='running')meta+=' '+j.progress+'%'+(j.speed?' · '+j.speed:'');
     if(j.note)meta+=' — '+j.note;
-    if(j.status==='done'&&j.file)meta+=' — '+j.file;
+    const pub=!!(j.public||j.can_open);
+    if(j.status==='done'&&j.file)meta+=' — '+(pub?'🖼️ في المعرض: ':'⚠️ ليس في المعرض: ')+j.file;
     if(j.status==='error'&&j.error)meta+=' — '+j.error;
     it.appendChild(el('div',meta,'m'));
     if(j.status==='running'||j.status==='queued'){
@@ -802,10 +1024,22 @@ function render(jobs){
       if(j.status==='error'){const c=el('button','ابحث عن الفيديو في الصفحة');
         c.onclick=()=>{$('url').value=j.url;window.scrollTo(0,0);scan(j.url)};r.appendChild(c)}
       it.appendChild(r);
-    }else if(j.status==='done'&&j.can_open){
-      const r=el('div',null,'row'),o=el('button','فتح'),h=el('button','مشاركة');
-      o.onclick=()=>post('/open',{id:j.id});h.onclick=()=>post('/open',{id:j.id,share:true});
-      r.appendChild(o);r.appendChild(h);it.appendChild(r);
+    }else if(j.status==='done'){
+      const r=el('div',null,'row');
+      if(j.can_open){
+        const o=el('button','فتح'),h=el('button','مشاركة');
+        o.onclick=()=>post('/open',{id:j.id});h.onclick=()=>post('/open',{id:j.id,share:true});
+        r.appendChild(o);r.appendChild(h);
+      }
+      if(!pub){
+        const g=el('button','📥 حفظ في المعرض');
+        g.onclick=async()=>{g.disabled=true;g.textContent='جارٍ الحفظ...';
+          try{const x=await post('/publish',{id:j.id});$('msg').textContent=x.error?('❌ '+x.error):'✅ تم الحفظ في المعرض'}
+          catch(e){$('msg').textContent='❌ '+e.message}
+          window.scrollTo(0,0);refresh()};
+        r.appendChild(g);
+      }
+      if(r.childNodes.length)it.appendChild(r);
     }
     box.appendChild(it);
   });
@@ -817,7 +1051,7 @@ async function start(url,extra){
   try{
     const j=await post('/start',Object.assign({url,fmt:$('fmt').value,playlist:!extra&&$('pl').checked},extra||{}));
     if(!j.id)throw new Error(j.error||'bad response');
-    $('msg').textContent=j.count>1?('أُضيف '+j.count+' فيديو إلى القائمة'):'أُضيف إلى القائمة';$('url').value='';fillFmt(DEF);
+    $('msg').textContent=j.count>1?('أُضيف '+j.count+' فيديو إلى القائمة'):'أُضيف إلى القائمة';$('url').value='';fillFmt(defOpts());
   }catch(e){$('msg').textContent='❌ تعذّر البدء: '+e.message}
   $('go').disabled=false; refresh();
 }
@@ -877,6 +1111,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/jobs":
             jobs = sorted(list(JOBS.values()), key=lambda j: -j.get("created", 0))
             self._json([public_view(j) for j in jobs])
+        elif u.path == "/caps":
+            self._json({"ffmpeg": find_ffmpeg() is not None, "version": APP_VERSION})
         elif u.path == "/status":
             jid = parse_qs(u.query).get("id", [""])[0]
             j = JOBS.get(jid)
@@ -936,6 +1172,11 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"items": scan_page(url)})
             except Exception as e:
                 return self._json({"error": str(e)[:200] or e.__class__.__name__}, 502)
+        if path == "/publish":
+            job, err = publish_job(str(data.get("id", "")))
+            if err:
+                return self._json({"error": err}, 500)
+            return self._json({"ok": True, "file": job.get("file")})
         if path == "/cancel":
             return self._json({"ok": cancel_job(str(data.get("id", "")))})
         if path == "/clear":

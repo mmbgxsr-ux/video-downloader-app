@@ -111,13 +111,19 @@ if ANDROID:
         Service.start(activity(), "")
 
     def request_notifications():
-        # Android 13+: without this the foreground-service notification is hidden.
+        # Android 13+: without POST_NOTIFICATIONS the foreground-service notification is hidden.
+        # Android 9 and older: WRITE_EXTERNAL_STORAGE is needed to save into Movies/Music.
         try:
-            perm = "android.permission.POST_NOTIFICATIONS"
-            if autoclass("android.os.Build$VERSION").SDK_INT >= 33:
-                act = activity()
-                if act.checkSelfPermission(perm) != 0:
-                    act.requestPermissions([perm], 0)
+            sdk = autoclass("android.os.Build$VERSION").SDK_INT
+            wanted = []
+            if sdk >= 33:
+                wanted.append("android.permission.POST_NOTIFICATIONS")
+            if sdk < 29:
+                wanted.append("android.permission.WRITE_EXTERNAL_STORAGE")
+            act = activity()
+            wanted = [p for p in wanted if act.checkSelfPermission(p) != 0]
+            if wanted:
+                act.requestPermissions(wanted, 0)
         except Exception:
             pass
 

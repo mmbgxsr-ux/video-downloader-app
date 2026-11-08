@@ -4,12 +4,12 @@ package.name = videodl
 package.domain = org.videodl
 source.dir = .
 source.include_exts = py,html,js,css,png,jpg,json
-version = 1.0
+version = 1.1
 requirements = python3,kivy==2.3.0,pyjnius,android,yt-dlp,certifi,openssl
 orientation = portrait
 fullscreen = 0
 p4a.branch = v2024.01.21
-android.permissions = INTERNET,FOREGROUND_SERVICE,POST_NOTIFICATIONS
+android.permissions = INTERNET,FOREGROUND_SERVICE,POST_NOTIFICATIONS,WRITE_EXTERNAL_STORAGE
 services = Downloader:service.py:foreground
 android.manifest.intent_filters = intent_filters.xml
 android.api = 33
