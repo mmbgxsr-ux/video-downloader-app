@@ -46,6 +46,14 @@ jobs:
           path: .buildozer
           key: p4a-${{ runner.os }}-${{ steps.week.outputs.week }}-${{ hashFiles('buildozer.spec', 'intent_filters.xml', 'cleartext.txt') }}
 
+      # Downloaded source tarballs are kept separately and saved even when the
+      # build fails, so a flaky download only has to succeed once.
+      - uses: actions/cache/restore@v4
+        with:
+          path: .buildozer/android/platform/build-arm64-v8a/packages
+          key: p4a-packages-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: p4a-packages-
+
       - name: Install system packages
         run: |
           sudo apt-get update
@@ -101,6 +109,13 @@ jobs:
             sleep 90
           done
           exit 1
+
+      - name: Save downloaded sources
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .buildozer/android/platform/build-arm64-v8a/packages
+          key: p4a-packages-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Show the real error
         if: failure()
