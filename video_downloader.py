@@ -61,11 +61,17 @@ class Cancelled(Exception):
 
 
 # ---------------------------------------------------------------- Android glue
-def _android_context():
-    """Activity (UI process) or Service (background process): both are Contexts."""
+CTX_ERRORS = []  # why no Android context could be found (shown in the job note)
+
+
+def _find_context():
+    """A Context in any process of the app: Activity (UI process), Service (background
+    process), or, as a last resort, the Application object."""
+    del CTX_ERRORS[:]
     try:
         from jnius import autoclass
-    except Exception:
+    except Exception as e:
+        CTX_ERRORS.append("jnius: %s" % str(e)[:100])
         return None
     for cls, field in (("org.kivy.android.PythonActivity", "mActivity"),
                        ("org.kivy.android.PythonService", "mService")):
@@ -73,9 +79,33 @@ def _android_context():
             ctx = getattr(autoclass(cls), field)
             if ctx is not None:
                 return ctx
-        except Exception:
-            pass
+            CTX_ERRORS.append("%s.%s=null" % (cls.rsplit(".", 1)[1], field))
+        except Exception as e:
+            CTX_ERRORS.append("%s: %s" % (cls.rsplit(".", 1)[1], str(e)[:80]))
+    try:
+        app = autoclass("android.app.ActivityThread").currentApplication()
+        if app is not None:
+            return app
+        CTX_ERRORS.append("currentApplication=null")
+    except Exception as e:
+        CTX_ERRORS.append("ActivityThread: %s" % str(e)[:80])
     return None
+
+
+_CTX = {"obj": None}
+ON_ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ
+
+
+def _android_context():
+    """Cached Context. It is resolved once in start_server(): the worker threads that run
+    downloads are plain Python threads and cannot always load the app's own Java classes
+    (PythonActivity / PythonService), so looking it up there can wrongly give None."""
+    if _CTX["obj"] is not None:
+        return _CTX["obj"]
+    ctx = _find_context()
+    if ctx is not None:
+        _CTX["obj"] = ctx
+    return ctx
 
 
 def data_dir():
@@ -105,6 +135,8 @@ def find_ffmpeg():
     a symlink named `ffmpeg` is created in the app's private dir for yt-dlp."""
     if _FF["checked"]:
         return _FF["exe"]
+    if ON_ANDROID and _android_context() is None:
+        return None  # try again later instead of remembering "no ffmpeg"
     _FF["checked"] = True
     cands = []  # (executable, ffmpeg_location for yt-dlp or None)
     w = shutil.which("ffmpeg")
@@ -134,6 +166,16 @@ def find_ffmpeg():
     return _FF["exe"]
 
 
+MIME_FIX = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".opus": "audio/ogg",
+            ".ogg": "audio/ogg", ".aac": "audio/aac", ".wav": "audio/x-wav", ".flac": "audio/flac"}
+
+
+def guess_mime(name):
+    return (MIME_FIX.get(os.path.splitext(name)[1].lower()) or mimetypes.guess_type(name)[0]
+            or "application/octet-stream")
+
+
 PUB_ERRORS = []  # why publishing to the public folders failed (shown in the job note)
 
 
@@ -152,7 +194,7 @@ def publish_to_downloads(path):
             PUB_ERRORS.append("أندرويد أقدم من 10")
             return None
         name = os.path.basename(path)
-        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        mime = guess_mime(name)
         ContentValues = autoclass("android.content.ContentValues")
         resolver = ctx.getContentResolver()
         targets = []
@@ -478,8 +520,11 @@ def run_job(jid):
             else:
                 path = ytdlp_download(job, job["url"], job["fmt"], out_dir, yt_dlp)
             pub = publish_to_downloads(path) if path else None
-            if path and not pub and PUB_ERRORS:
-                job["note"] = "تعذّر النسخ للمجلد العام: " + " | ".join(PUB_ERRORS)[:300]
+            if path and not pub:
+                if PUB_ERRORS:
+                    job["note"] = "تعذّر النسخ للمجلد العام: " + " | ".join(PUB_ERRORS)[:300]
+                elif "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ:
+                    job["note"] = "تعذّر الوصول لسياق أندرويد: " + " | ".join(CTX_ERRORS)[:300]
             job["file"] = pub["display"] if pub else path
             job["can_open"] = bool(pub)
             if pub:
@@ -913,6 +958,10 @@ class H(BaseHTTPRequestHandler):
 
 def start_server():
     """Bind first, then serve in a thread (so the port is listening on return)."""
+    try:
+        _android_context()  # resolve and cache the Android Context from this (Java-created) thread
+    except Exception:
+        pass
     server = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
