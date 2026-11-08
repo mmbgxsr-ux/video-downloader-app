@@ -58,6 +58,21 @@ jobs:
           pip install --upgrade pip
           pip install buildozer cython==0.29.36 virtualenv
 
+      # www.openssl.org sometimes answers 504 and fails the whole build. Fetch the
+      # same official tarball from GitHub, verify its checksum, and drop it where
+      # python-for-android looks, so its own download is skipped.
+      - name: Pre-fetch OpenSSL source
+        run: |
+          d=.buildozer/android/platform/build-arm64-v8a/packages/openssl
+          f=openssl-1.1.1w.tar.gz
+          mkdir -p "$d"
+          if [ ! -f "$d/.mark-$f" ]; then
+            curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o "$d/$f" \
+              "https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/$f"
+            echo "cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8  $d/$f" | sha256sum -c -
+            touch "$d/.mark-$f"
+          fi
+
       - name: Build APK
         run: |
           set -o pipefail
