@@ -4,7 +4,7 @@ package.name = videodl
 package.domain = org.videodl
 source.dir = .
 source.include_exts = py,html,js,css,png,jpg,json
-version = 1.1
+version = 1.2
 requirements = python3,kivy==2.3.0,pyjnius,android,yt-dlp,certifi,openssl
 orientation = portrait
 fullscreen = 0

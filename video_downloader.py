@@ -9,7 +9,7 @@
 يُنصح بتثبيت ffmpeg لدمج الصوت والصورة وتحويل MP3.
 استخدمها فقط للمحتوى الذي تملكه أو يُسمح لك بتحميله.
 """
-import html, http.client, json, mimetypes, os, re, shutil, subprocess, threading, time, uuid, webbrowser
+import html, http.client, json, mimetypes, os, re, shutil, subprocess, threading, time, traceback, uuid, webbrowser
 import urllib.error, urllib.request
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,11 +25,12 @@ FINAL = ("done", "error", "cancelled")
 ALLOWED_HOSTS = {"127.0.0.1:%d" % PORT, "localhost:%d" % PORT}
 ALLOWED_ORIGINS = {"http://127.0.0.1:%d" % PORT, "http://localhost:%d" % PORT}
 DIRECT_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".mp3")
+INFLIGHT = 0  # requests being served right now
 LAST_ACTIVITY = time.time()  # last HTTP request; lets the Android service stop when idle
 _LOADED = False
 _SAVE_LOCK = threading.Lock()
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 # audio choices: code -> (codec for ffmpeg, bitrate or None)
 AUDIO_FMTS = {"audio": ("mp3", "192"), "audio_320": ("mp3", "320"),
@@ -474,7 +475,7 @@ def _trim_jobs():
 
 
 def is_busy():
-    return any(j.get("status") in ("queued", "running") for j in list(JOBS.values()))
+    return INFLIGHT > 0 or any(j.get("status") in ("queued", "running") for j in list(JOBS.values()))
 
 
 # ------------------------------------------------------------------ downloads
@@ -952,7 +953,18 @@ button{background:var(--pri);color:#fff;border:0;cursor:pointer;font-weight:bold
 <div class="card"><h2><span>التحميلات</span><button class="link" id="clr">مسح السجل</button></h2><div id="list"></div></div>
 <script>
 const $=id=>document.getElementById(id);
-const post=(p,b)=>fetch(p,{method:'POST',body:JSON.stringify(b||{})}).then(r=>r.json());
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function post(p,b){
+  for(let i=1;;i++){
+    try{const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})});return await r.json()}
+    catch(e){
+      if(e instanceof SyntaxError)throw new Error('رد غير صالح من السيرفر المحلي');
+      if(i>=10)throw new Error('السيرفر المحلي متوقف. أغلق التطبيق تماماً وافتحه من جديد');
+      $('msg').textContent='⏳ السيرفر المحلي يُعاد تشغيله... ('+i+'/10)';
+      await sleep(1500);
+    }
+  }
+}
 const ST={queued:'في الانتظار',running:'جارٍ التحميل',done:'✅ تم',error:'❌ فشل',cancelled:'أُلغي'};
 function el(tag,text,cls){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
 /* theme */
@@ -1103,7 +1115,7 @@ class H(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return origin is None or origin in ALLOWED_ORIGINS
 
-    def do_GET(self):
+    def _get(self):
         if not self._local_only():
             return self._json({"error": "forbidden"}, 403)
         _ensure_loaded()
@@ -1120,7 +1132,7 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send(PAGE, "text/html")
 
-    def do_POST(self):
+    def _post(self):
         if not self._local_only():
             return self._json({"error": "forbidden"}, 403)
         _ensure_loaded()
@@ -1192,6 +1204,31 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)[:200]}, 500)
         self._json({"error": "not found"}, 404)
+
+    def _guard(self, fn):
+        """Never drop the connection: an unexpected error becomes a JSON reply (the page used
+        to show a bare "Failed to fetch"). INFLIGHT keeps the Android service alive while a
+        long request (e.g. reading a playlist) is still being served."""
+        global INFLIGHT
+        INFLIGHT += 1
+        try:
+            fn()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                self._json({"error": "خطأ داخلي: %s: %s" % (e.__class__.__name__, str(e)[:160])}, 500)
+            except Exception:
+                pass
+        finally:
+            INFLIGHT -= 1
+
+    def do_GET(self):
+        self._guard(self._get)
+
+    def do_POST(self):
+        self._guard(self._post)
 
     def log_message(self, *a):
         pass

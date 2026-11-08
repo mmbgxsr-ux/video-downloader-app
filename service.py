@@ -9,7 +9,7 @@ import traceback
 
 import video_downloader as vd
 
-IDLE_SECONDS = 120
+IDLE_SECONDS = 300
 
 
 def stop_service():

@@ -161,6 +161,8 @@ class DownloaderApp(App):
         self.opened = False
         self.shared = None
         self.listener_ready = False
+        self.misses = 0
+        Clock.schedule_interval(self.watchdog, 4)
         if STATE["error"] is None:
             if ANDROID:
                 try:
@@ -232,6 +234,32 @@ class DownloaderApp(App):
         else:
             self.label.text = "Open " + BASE_URL
             webbrowser.open(url)
+
+    def watchdog(self, dt):
+        """Once the page is open, make sure the local server stays up: if it stops answering
+        (service killed by Android or stopped itself), start it again. The open page keeps
+        polling and reconnects on its own, so nothing has to be reloaded."""
+        if not self.opened or STATE["error"]:
+            return
+        if self.server_ok():
+            self.misses = 0
+            return
+        self.misses += 1
+        if self.misses < 2:  # one slow answer is not an outage
+            return
+        self.misses = 0
+        try:
+            if ANDROID and self.mode == "service":
+                start_service()
+            elif self.server is None:
+                self.start_local()
+        except Exception:
+            traceback.print_exc()
+            if self.server is None:
+                try:
+                    self.start_local()
+                except Exception:
+                    traceback.print_exc()
 
     def on_pause(self):
         return True  # keep the app alive in the background
